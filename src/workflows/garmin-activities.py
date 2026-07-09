@@ -171,6 +171,11 @@ def activity_needs_update(existing_activity: dict, new_activity: dict) -> bool:
         existing_props['Distance (km)']['number'] != round(new_activity.get('distance', 0) / 1000, 2) or
         existing_props['Duration (min)']['number'] != round(new_activity.get('duration', 0) / 60, 2) or
         existing_props['Calories']['number'] != round(new_activity.get('calories', 0)) or
+        (existing_props['Avg HR']['number'] or 0) != round(new_activity.get('averageHR') or 0) or
+        (existing_props['Max HR']['number'] or 0) != round(new_activity.get('maxHR') or 0) or
+        (existing_props['Avg Cadence']['number'] or 0) != round(new_activity.get('averageRunningCadenceInStepsPerMinute') or new_activity.get('averageBikingCadenceInRevPerMinute') or 0) or
+        (existing_props['Elevation Gain (m)']['number'] or 0) != round(new_activity.get('elevationGain') or 0, 1) or
+        (existing_props['Training Load']['number'] or 0) != round(new_activity.get('activityTrainingLoad') or 0, 1) or
         existing_props['Avg Pace']['rich_text'][0]['text']['content'] != format_pace(
             new_activity.get('averageSpeed', 0)
         ) or
@@ -215,6 +220,11 @@ def create_activity(notion_client: NotionClient, database_id: str, activity: dic
         "Distance (km)": {"number": round(activity.get('distance', 0) / 1000, 2)},
         "Duration (min)": {"number": round(activity.get('duration', 0) / 60, 2)},
         "Calories": {"number": round(activity.get('calories', 0))},
+        "Avg HR": {"number": round(activity.get('averageHR') or 0)},
+        "Max HR": {"number": round(activity.get('maxHR') or 0)},
+        "Avg Cadence": {"number": round(activity.get('averageRunningCadenceInStepsPerMinute') or activity.get('averageBikingCadenceInRevPerMinute') or 0)},
+        "Elevation Gain (m)": {"number": round(activity.get('elevationGain') or 0, 1)},
+        "Training Load": {"number": round(activity.get('activityTrainingLoad') or 0, 1)},
         "Avg Pace": {"rich_text": [{"text": {"content": format_pace(activity.get('averageSpeed', 0))}}]},
         "Avg Power": {"number": round(activity.get('avgPower', 0), 1)},
         "Max Power": {"number": round(activity.get('maxPower', 0), 1)},
@@ -259,6 +269,11 @@ def update_activity(notion_client: NotionClient, existing_activity: dict, new_ac
         "Distance (km)": {"number": round(new_activity.get('distance', 0) / 1000, 2)},
         "Duration (min)": {"number": round(new_activity.get('duration', 0) / 60, 2)},
         "Calories": {"number": round(new_activity.get('calories', 0))},
+        "Avg HR": {"number": round(new_activity.get('averageHR') or 0)},
+        "Max HR": {"number": round(new_activity.get('maxHR') or 0)},
+        "Avg Cadence": {"number": round(new_activity.get('averageRunningCadenceInStepsPerMinute') or new_activity.get('averageBikingCadenceInRevPerMinute') or 0)},
+        "Elevation Gain (m)": {"number": round(new_activity.get('elevationGain') or 0, 1)},
+        "Training Load": {"number": round(new_activity.get('activityTrainingLoad') or 0, 1)},
         "Avg Pace": {"rich_text": [{"text": {"content": format_pace(new_activity.get('averageSpeed', 0))}}]},
         "Avg Power": {"number": round(new_activity.get('avgPower', 0), 1)},
         "Max Power": {"number": round(new_activity.get('maxPower', 0), 1)},
