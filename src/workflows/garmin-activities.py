@@ -298,7 +298,7 @@ def main():
     database_id = notion_dbs.activities
 
     # Get all activities
-    activities = get_all_activities(garmin_client, garmin_configuration.activity_fetch_limit)
+    activities = get_all_activities(garmin_client, 2000)
 
     # Process all activities
     for activity in activities:
