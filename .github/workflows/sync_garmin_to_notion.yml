@@ -35,6 +35,3 @@ jobs:
           TZ: 'America/Toronto'
         run: |
           uv run python -m src.workflows.garmin-activities
-          uv run python -m src.workflows.personal-records
-          uv run python -m src.workflows.daily-steps
-          uv run python -m src.workflows.sleep-data
