@@ -310,98 +310,125 @@ def _aerobic_decoupling(samples: list) -> float | None:
 
 def _build_chart_url(samples: list) -> str | None:
     # Build a QuickChart (Chart.js) line chart of HR and pace over time, embeddable as an image.
+    # Notion rejects image URLs longer than 2000 chars, so we progressively drop points until the
+    # encoded payload is small enough to keep the final URL comfortably under that cap.
     if len(samples) < 5:
         return None
-    step = max(1, len(samples) // 60)
-    ds = samples[::step]
-    labels = [round(s['t'] / 60, 1) for s in ds]  # minutes
-    hr = [round(s['hr']) for s in ds]
-    pace = [round(1000 / (s['spd'] * 60), 2) if s['spd'] > 0 else None for s in ds]  # min/km
-    config = {
-        "type": "line",
-        "data": {
-            "labels": labels,
-            "datasets": [
-                {"label": "HR (bpm)", "data": hr, "yAxisID": "yHR",
-                 "borderColor": "rgb(220,50,50)", "pointRadius": 0, "borderWidth": 2, "fill": False},
-                {"label": "Pace (min/km)", "data": pace, "yAxisID": "yPace",
-                 "borderColor": "rgb(50,110,220)", "pointRadius": 0, "borderWidth": 2, "fill": False},
-            ],
-        },
-        "options": {
-            "scales": {
-                "yHR": {"type": "linear", "position": "left"},
-                "yPace": {"type": "linear", "position": "right", "reverse": True},
+    encoded = ""
+    for target_points in (30, 24, 18, 14):
+        step = max(1, len(samples) // target_points)
+        ds = samples[::step]
+        labels = [round(s['t'] / 60) for s in ds]  # minutes
+        hr = [round(s['hr']) for s in ds]
+        pace = [round(1000 / (s['spd'] * 60), 1) if s['spd'] > 0 else None for s in ds]  # min/km
+        config = {
+            "type": "line",
+            "data": {
+                "labels": labels,
+                "datasets": [
+                    {"label": "HR", "data": hr, "yAxisID": "yHR",
+                     "borderColor": "rgb(220,50,50)", "pointRadius": 0, "borderWidth": 2, "fill": False},
+                    {"label": "Pace", "data": pace, "yAxisID": "yPace",
+                     "borderColor": "rgb(50,110,220)", "pointRadius": 0, "borderWidth": 2, "fill": False},
+                ],
             },
-            "plugins": {"title": {"display": True, "text": "Heart rate & pace over time (minutes)"}},
-        },
-    }
-    encoded = urllib.parse.quote(json.dumps(config, separators=(',', ':')))
+            "options": {
+                "scales": {
+                    "yHR": {"position": "left"},
+                    "yPace": {"position": "right", "reverse": True},
+                },
+                "plugins": {"legend": {"labels": {"boxWidth": 12}}},
+            },
+        }
+        encoded = urllib.parse.quote(json.dumps(config, separators=(',', ':')))
+        if len(encoded) <= 1900:  # ~70-char base URL is added below, so this stays well under 2000
+            break
     return f"https://quickchart.io/chart?w=650&h=320&backgroundColor=white&c={encoded}"
 
 
-def add_chart_and_series(
+def add_charts(
     notion_client: NotionClient,
     garmin_client: GarminClient,
     page_id: str,
     activity_id,
     activity_type: str,
     duration_min: float,
-) -> tuple:
-    # Fetch the second-by-second stream, write a chart image + a downsampled data toggle to the page,
-    # and return (status, decoupling). status is "added", "skip" or "error".
+    need_series: bool,
+    need_image: bool,
+) -> dict:
+    # Fetch the second-by-second stream once, then optionally write a downsampled data toggle
+    # and/or an HR/pace chart image. Returns {"series", "image", "decoupling"} where series/image
+    # are "added"/"skip"/"error"/"na".
+    result = {"series": "na", "image": "na", "decoupling": None}
+    if not need_series and not need_image:
+        return result
     try:
         details = garmin_client.get_activity_details(activity_id, maxchart=2000, maxpoly=0)
     except Exception as e:
         print(f"  Could not fetch details for activity {activity_id}: {e}")
-        return "error", None
+        if need_series:
+            result["series"] = "error"
+        if need_image:
+            result["image"] = "error"
+        return result
 
     samples = _parse_detail_series(details)
     if len(samples) < 5:
-        return "skip", None
+        # No usable stream (e.g. strength) - mark done so we don't retry forever.
+        if need_series:
+            result["series"] = "skip"
+        if need_image:
+            result["image"] = "skip"
+        return result
 
-    # Aerobic decoupling is only meaningful for steady runs of a reasonable length.
-    decoupling = None
-    if activity_type == "Running" and (duration_min or 0) >= 20:
-        decoupling = _aerobic_decoupling(samples)
+    # Downsampled time-series + decoupling metric (for precise analysis).
+    if need_series:
+        if activity_type == "Running" and (duration_min or 0) >= 20:
+            result["decoupling"] = _aerobic_decoupling(samples)
+        step = max(1, len(samples) // 90)
+        ds = samples[::step]
+        series = {
+            "t_s": [round(s['t']) for s in ds],
+            "hr": [round(s['hr']) for s in ds],
+            "spd_ms": [round(s['spd'], 2) for s in ds],
+        }
+        series_json = json.dumps(series, separators=(',', ':'))
+        toggle_block = {
+            "object": "block", "type": "toggle",
+            "toggle": {
+                "rich_text": _rt("🔬 Downsampled time-series (for analysis)"),
+                "children": [
+                    {"object": "block", "type": "code",
+                     "code": {"language": "json", "rich_text": _rt_chunks(series_json)}}
+                ],
+            },
+        }
+        try:
+            notion_client.blocks.children.append(block_id=page_id, children=[toggle_block])
+            result["series"] = "added"
+        except Exception as e:
+            print(f"  Could not write time-series to page {page_id}: {e}")
+            result["series"] = "error"
 
-    # Chart image (best-effort: a bad or over-long URL must not cost us the analysis data below).
-    header_blocks = [{"object": "block", "type": "heading_3",
-                      "heading_3": {"rich_text": _rt("📈 In-workout charts & data")}}]
-    chart_url = _build_chart_url(samples)
-    if chart_url:
-        header_blocks.append({"object": "block", "type": "image",
-                              "image": {"type": "external", "external": {"url": chart_url}}})
-    try:
-        notion_client.blocks.children.append(block_id=page_id, children=header_blocks)
-    except Exception as e:
-        print(f"  Chart image skipped for page {page_id}: {e}")
-
-    # Downsampled series (about 90 points), tucked in a collapsed toggle for precise analysis.
-    step = max(1, len(samples) // 90)
-    ds = samples[::step]
-    series = {
-        "t_s": [round(s['t']) for s in ds],
-        "hr": [round(s['hr']) for s in ds],
-        "spd_ms": [round(s['spd'], 2) for s in ds],
-    }
-    series_json = json.dumps(series, separators=(',', ':'))
-    toggle_block = {
-        "object": "block", "type": "toggle",
-        "toggle": {
-            "rich_text": _rt("🔬 Downsampled time-series (for analysis)"),
-            "children": [
-                {"object": "block", "type": "code",
-                 "code": {"language": "json", "rich_text": _rt_chunks(series_json)}}
-            ],
-        },
-    }
-    try:
-        notion_client.blocks.children.append(block_id=page_id, children=[toggle_block])
-    except Exception as e:
-        print(f"  Could not write time-series to page {page_id}: {e}")
-        return "error", decoupling
-    return "added", decoupling
+    # HR/pace chart image (compact URL so Notion accepts it).
+    if need_image:
+        chart_url = _build_chart_url(samples)
+        if not chart_url:
+            result["image"] = "skip"
+        else:
+            blocks = [
+                {"object": "block", "type": "heading_3",
+                 "heading_3": {"rich_text": _rt("📈 HR & pace chart")}},
+                {"object": "block", "type": "image",
+                 "image": {"type": "external", "external": {"url": chart_url}}},
+            ]
+            try:
+                notion_client.blocks.children.append(block_id=page_id, children=blocks)
+                result["image"] = "added"
+            except Exception as e:
+                print(f"  Chart image skipped for page {page_id}: {e}")
+                result["image"] = "error"
+    return result
 
 
 def create_activity(notion_client: NotionClient, database_id: str, activity: dict) -> dict:
@@ -517,63 +544,77 @@ def main():
     database_id = notion_dbs.activities
 
     # Get all activities
-    activities = get_all_activities(garmin_client, 70)
+    activities = get_all_activities(garmin_client, 1000)
 
     # Process all activities
     for activity in activities:
-        activity_date_raw: str = activity.get('startTimeGMT')
-        activity_date: datetime = (
-            datetime
-            .strptime(activity_date_raw, '%Y-%m-%d %H:%M:%S')  # Parse as format received from Garmin
-            .replace(tzinfo=UTC)  # Set timezone to UTC, as Garmin times are in GMT/UTC. Close enough.
-        )
-
-        activity_name = format_entertainment(activity.get('activityName', 'Unnamed Activity'))
-        activity_type, activity_subtype = format_activity_type(
-            activity.get('activityType', {}).get('typeKey', 'Unknown'),
-            activity_name
-        )
-
-        # Check if activity already exists in Notion
-        existing_activity = activity_exists(notion_client, database_id, activity_date, activity_type, activity_name)
-
-        if existing_activity:
-            if activity_needs_update(existing_activity, activity):
-                update_activity(notion_client, existing_activity, activity)
-                # print(f"Updated: {activity_type} - {activity_name}")
-            page_id = existing_activity['id']
-            has_laps = (existing_activity['properties'].get('Has Lap Data') or {}).get('checkbox') or False
-        else:
-            created_page = create_activity(notion_client, database_id, activity)
-            page_id = created_page.get('id') if created_page else None
-            has_laps = False
-
-        # Phase 2: write the per-lap interval breakdown onto the page (once per activity)
-        activity_id = activity.get('activityId')
-        if page_id and activity_id and not has_laps:
-            lap_status = add_lap_data(notion_client, garmin_client, page_id, activity_id)
-            if lap_status in ("added", "skip"):
-                notion_client.pages.update(
-                    page_id=page_id,
-                    properties={"Has Lap Data": {"checkbox": True}},
-                )
-            time.sleep(0.3)  # be gentle on the Garmin API
-
-        # Phase 2: charts + downsampled series + decoupling metric (once per activity)
-        has_charts = False
-        if existing_activity:
-            has_charts = (existing_activity['properties'].get('Has Charts') or {}).get('checkbox') or False
-        if page_id and activity_id and not has_charts:
-            duration_min = round(activity.get('duration', 0) / 60, 2)
-            chart_status, decoupling = add_chart_and_series(
-                notion_client, garmin_client, page_id, activity_id, activity_type, duration_min
+        # Guard each activity so a single transient Notion/Garmin hiccup (e.g. a request timeout)
+        # skips just that one activity instead of aborting the whole sync. Skipped activities are
+        # safely retried on the next run (the date+name dedup prevents duplicates).
+        try:
+            activity_date_raw: str = activity.get('startTimeGMT')
+            activity_date: datetime = (
+                datetime
+                .strptime(activity_date_raw, '%Y-%m-%d %H:%M:%S')  # Parse as format received from Garmin
+                .replace(tzinfo=UTC)  # Set timezone to UTC, as Garmin times are in GMT/UTC. Close enough.
             )
-            if chart_status in ("added", "skip"):
-                chart_props = {"Has Charts": {"checkbox": True}}
-                if decoupling is not None:
-                    chart_props["Aerobic Decoupling (%)"] = {"number": decoupling}
-                notion_client.pages.update(page_id=page_id, properties=chart_props)
-            time.sleep(0.4)  # be gentle on the Garmin API
+
+            activity_name = format_entertainment(activity.get('activityName', 'Unnamed Activity'))
+            activity_type, activity_subtype = format_activity_type(
+                activity.get('activityType', {}).get('typeKey', 'Unknown'),
+                activity_name
+            )
+
+            # Check if activity already exists in Notion
+            existing_activity = activity_exists(notion_client, database_id, activity_date, activity_type, activity_name)
+
+            if existing_activity:
+                if activity_needs_update(existing_activity, activity):
+                    update_activity(notion_client, existing_activity, activity)
+                    # print(f"Updated: {activity_type} - {activity_name}")
+                page_id = existing_activity['id']
+                has_laps = (existing_activity['properties'].get('Has Lap Data') or {}).get('checkbox') or False
+            else:
+                created_page = create_activity(notion_client, database_id, activity)
+                page_id = created_page.get('id') if created_page else None
+                has_laps = False
+
+            # Phase 2: write the per-lap interval breakdown onto the page (once per activity)
+            activity_id = activity.get('activityId')
+            if page_id and activity_id and not has_laps:
+                lap_status = add_lap_data(notion_client, garmin_client, page_id, activity_id)
+                if lap_status in ("added", "skip"):
+                    notion_client.pages.update(
+                        page_id=page_id,
+                        properties={"Has Lap Data": {"checkbox": True}},
+                    )
+                time.sleep(0.3)  # be gentle on the Garmin API
+
+            # Phase 2: downsampled series + decoupling metric + HR/pace chart image (once per activity)
+            has_charts = False
+            has_chart_image = False
+            if existing_activity:
+                has_charts = (existing_activity['properties'].get('Has Charts') or {}).get('checkbox') or False
+                has_chart_image = (existing_activity['properties'].get('Has Chart Image') or {}).get('checkbox') or False
+            if page_id and activity_id and (not has_charts or not has_chart_image):
+                duration_min = round(activity.get('duration', 0) / 60, 2)
+                chart_res = add_charts(
+                    notion_client, garmin_client, page_id, activity_id, activity_type,
+                    duration_min, need_series=not has_charts, need_image=not has_chart_image,
+                )
+                chart_props = {}
+                if not has_charts and chart_res["series"] in ("added", "skip"):
+                    chart_props["Has Charts"] = {"checkbox": True}
+                    if chart_res["decoupling"] is not None:
+                        chart_props["Aerobic Decoupling (%)"] = {"number": chart_res["decoupling"]}
+                if not has_chart_image and chart_res["image"] in ("added", "skip"):
+                    chart_props["Has Chart Image"] = {"checkbox": True}
+                if chart_props:
+                    notion_client.pages.update(page_id=page_id, properties=chart_props)
+                time.sleep(0.4)  # be gentle on the Garmin API
+        except Exception as e:
+            print(f"  Skipping '{activity.get('activityName', '?')}' after error: {e}")
+            continue
 
 
 if __name__ == '__main__':
