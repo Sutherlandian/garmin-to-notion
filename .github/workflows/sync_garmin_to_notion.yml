@@ -37,8 +37,7 @@ name: Restore previous Garmin session
 uses: actions/cache@v4
 with:
 path: .garminconnect
-key: garmin-session-
-𝑔𝑖𝑡ℎ𝑏.𝑟𝑢𝑛𝑖𝑑−github.run
+key: garmin-session-𝑔𝑖𝑡ℎ𝑏.𝑟𝑢𝑛𝑖𝑑−github.run
 id−{{ github.run_attempt }}
 restore-keys: |
 garmin-session-
