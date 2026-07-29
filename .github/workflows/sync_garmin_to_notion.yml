@@ -1,37 +1,61 @@
 name: Sync Garmin to Notion
-
 on:
-  schedule:
-    - cron: '0 1 * * *' # Daily
-  workflow_dispatch:
-    inputs:
-      GARMIN_ACTIVITIES_FETCH_LIMIT:
-        type: number
-        default: 10
-env:
-  TZ: 'America/Toronto'
-
+schedule:
+cron: "0 1   *"
+workflow_dispatch:
+inputs:
+GARMIN_ACTIVITIES_FETCH_LIMIT:
+description: "Maximum number of Garmin activities to fetch"
+required: false
+default: "10"
+permissions:
+contents: read
 jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v5
-
-      - name: Install dependencies
-        run: uv sync
-
-      - name: Run script
-        env:
-          GARMIN_AUTH_TOKEN: ${{ secrets.GARMIN_AUTH_TOKEN }}
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
-          NOTION_PR_DB_ID: ${{ secrets.NOTION_PR_DB_ID }}
-          NOTION_STEPS_DB_ID: ${{ secrets.NOTION_STEPS_DB_ID }}
-          NOTION_SLEEP_DB_ID: ${{ secrets.NOTION_SLEEP_DB_ID }}
-          GARMIN_ACTIVITIES_FETCH_LIMIT: ${{ inputs.GARMIN_ACTIVITIES_FETCH_LIMIT || '10' }}
-          TZ: 'America/Toronto'
-        run: |
-          uv run python -m src.workflows.garmin-activities
+sync-garmin-activities:
+runs-on: ubuntu-latest
+timeout-minutes: 30
+env:
+TZ: Europe/London
+GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+GARMINTOKENS: .garminconnect
+NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+GARMIN_ACTIVITIES_FETCH_LIMIT: ${{ inputs.GARMIN_ACTIVITIES_FETCH_LIMIT || '10' }}
+steps:
+name: Check out repository
+uses: actions/checkout@v4
+name: Install uv
+uses: astral-sh/setup-uv@v5
+with:
+enable-cache: true
+name: Install Python
+run: uv python install 3.13
+name: Install project dependencies
+run: uv sync
+name: Restore previous Garmin session
+uses: actions/cache@v4
+with:
+path: .garminconnect
+key: garmin-session-
+𝑔
+𝑖
+𝑡
+ℎ
+𝑢
+𝑏
+.
+𝑟
+𝑢
+𝑛
+𝑖
+𝑑
+−
+github.run 
+i
+​
+ d−{{ github.run_attempt }}
+restore-keys: |
+garmin-session-
+name: Sync Garmin activities to Notion
+run: uv run python -m src.workflows.garmin-activities
