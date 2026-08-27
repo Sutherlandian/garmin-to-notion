@@ -1,9 +1,8 @@
 from datetime import datetime, UTC, timedelta
-
+import sys
 import time
 import json
 import urllib.parse
-
 import pytz
 from dotenv import load_dotenv
 from garminconnect import Garmin as GarminClient
@@ -38,7 +37,33 @@ ACTIVITY_ICONS = {
 
 
 def get_all_activities(garmin_client: GarminClient, limit: int = 1000) -> list[dict]:
-    return garmin_client.get_activities(0, limit)
+    # Fetch recent activities. If the paged endpoint hands back an empty list, retry once
+    # using an explicit date range before concluding there is genuinely nothing to sync.
+    activities = garmin_client.get_activities(0, limit)
+
+    if not isinstance(activities, list):
+        print(f"WARNING: Garmin returned {type(activities).__name__}, not a list. Treating as empty.")
+        activities = []
+
+    print(f"Garmin returned {len(activities)} activities from get_activities(0, {limit}).")
+    if activities:
+        return activities
+
+    end_date = datetime.now(UTC).date()
+    start_date = end_date - timedelta(days=120)
+    print(f"Empty list. Retrying with an explicit date range: {start_date} to {end_date}")
+
+    try:
+        by_date = garmin_client.get_activities_by_date(start_date.isoformat(), end_date.isoformat())
+    except Exception as e:
+        print(f"Date-range fallback also failed: {e}")
+        return []
+
+    if not isinstance(by_date, list):
+        by_date = []
+
+    print(f"Date-range fallback returned {len(by_date)} activities.")
+    return by_date
 
 
 def format_activity_type(activity_type: str, activity_name: str = "") -> tuple[str, str]:
@@ -63,7 +88,6 @@ def format_activity_type(activity_type: str, activity_name: str = "") -> tuple[s
     # Special replacement for Rowing V2
     if formatted_type == "Rowing V2":
         activity_type = "Rowing"
-
     # Special case for Yoga and Pilates
     elif formatted_type in ["Yoga", "Pilates"]:
         activity_type = "Yoga/Pilates"
@@ -128,13 +152,11 @@ def activity_exists(
     activity_name: str,
 ) -> dict | None:
     # Check if an activity already exists in the Notion database and return it if found.
-
     # Determine the correct activity type for the lookup
     lookup_type = "Stretching" if "stretch" in activity_name.lower() else activity_type
 
-    # Create a time window to search for the activity. Notion has been observed to truncate datetimes to the minutes in
-    # some instances, causing the lookup using exact datetime to fail.
-    # TODO: We should store the activity ID in the Notion page to avoid this complexity.
+    # Create a time window to search for the activity. Notion has been observed to truncate
+    # datetimes to the minutes in some instances, causing exact datetime lookups to fail.
     lookup_min_date = activity_date - timedelta(minutes=5)
     lookup_max_date = activity_date + timedelta(minutes=5)
 
@@ -157,7 +179,6 @@ def activity_exists(
 
 def activity_needs_update(existing_activity: dict, new_activity: dict) -> bool:
     existing_props = existing_activity['properties']
-
     activity_name = new_activity.get('activityName', '').lower()
     activity_type, activity_subtype = format_activity_type(
         new_activity.get('activityType', {}).get('typeKey', 'Unknown'),
@@ -223,8 +244,10 @@ def add_lap_data(notion_client: NotionClient, garmin_client: GarminClient, page_
         return "skip"  # single-lap activity: no interval breakdown worth showing
 
     laps = laps[:90]  # Notion caps children per request; 90 keeps us safely under the limit
+
     header = ["Lap", "Dist (km)", "Time", "Pace", "Avg HR", "Max HR"]
     table_rows = [{"type": "table_row", "table_row": {"cells": [_rt(c) for c in header]}}]
+
     for i, lap in enumerate(laps, 1):
         dur_s = lap.get('duration') or 0
         row = [
@@ -248,11 +271,13 @@ def add_lap_data(notion_client: NotionClient, garmin_client: GarminClient, page_
              "children": table_rows,
          }},
     ]
+
     try:
         notion_client.blocks.children.append(block_id=page_id, children=children)
     except Exception as e:
         print(f"  Could not write lap table to page {page_id}: {e}")
         return "error"
+
     return "added"
 
 
@@ -271,11 +296,13 @@ def _parse_detail_series(details: dict) -> list:
         key = d.get('key')
         if key is not None:
             idx[key] = d.get('metricsIndex')
+
     t_i = idx.get('sumElapsedDuration', idx.get('sumDuration'))
     hr_i = idx.get('directHeartRate')
     spd_i = idx.get('directSpeed')
     if t_i is None or hr_i is None or spd_i is None:
         return []
+
     samples = []
     for point in (details.get('activityDetailMetrics') or []):
         m = point.get('metrics') or []
@@ -290,7 +317,7 @@ def _parse_detail_series(details: dict) -> list:
 
 
 def _aerobic_decoupling(samples: list) -> float | None:
-    # Aerobic decoupling %: how much speed-per-HR efficiency fades from the first half to the second half.
+    # Aerobic decoupling %: how much speed-per-HR efficiency fades from the first half to the second.
     valid = [s for s in samples if s['hr'] > 0 and s['spd'] > 0]
     if len(valid) < 10:
         return None
@@ -314,6 +341,7 @@ def _build_chart_url(samples: list) -> str | None:
     # encoded payload is small enough to keep the final URL comfortably under that cap.
     if len(samples) < 5:
         return None
+
     encoded = ""
     for target_points in (30, 24, 18, 14):
         step = max(1, len(samples) // target_points)
@@ -321,6 +349,7 @@ def _build_chart_url(samples: list) -> str | None:
         labels = [round(s['t'] / 60) for s in ds]  # minutes
         hr = [round(s['hr']) for s in ds]
         pace = [round(1000 / (s['spd'] * 60), 1) if s['spd'] > 0 else None for s in ds]  # min/km
+
         config = {
             "type": "line",
             "data": {
@@ -340,9 +369,11 @@ def _build_chart_url(samples: list) -> str | None:
                 "plugins": {"legend": {"labels": {"boxWidth": 12}}},
             },
         }
+
         encoded = urllib.parse.quote(json.dumps(config, separators=(',', ':')))
         if len(encoded) <= 1900:  # ~70-char base URL is added below, so this stays well under 2000
             break
+
     return f"https://quickchart.io/chart?w=650&h=320&backgroundColor=white&c={encoded}"
 
 
@@ -362,6 +393,7 @@ def add_charts(
     result = {"series": "na", "image": "na", "decoupling": None}
     if not need_series and not need_image:
         return result
+
     try:
         details = garmin_client.get_activity_details(activity_id, maxchart=2000, maxpoly=0)
     except Exception as e:
@@ -385,6 +417,7 @@ def add_charts(
     if need_series:
         if activity_type == "Running" and (duration_min or 0) >= 20:
             result["decoupling"] = _aerobic_decoupling(samples)
+
         step = max(1, len(samples) // 90)
         ds = samples[::step]
         series = {
@@ -393,6 +426,7 @@ def add_charts(
             "spd_ms": [round(s['spd'], 2) for s in ds],
         }
         series_json = json.dumps(series, separators=(',', ':'))
+
         toggle_block = {
             "object": "block", "type": "toggle",
             "toggle": {
@@ -428,6 +462,7 @@ def add_charts(
             except Exception as e:
                 print(f"  Chart image skipped for page {page_id}: {e}")
                 result["image"] = "error"
+
     return result
 
 
@@ -447,7 +482,7 @@ def create_activity(notion_client: NotionClient, database_id: str, activity: dic
         "Date": {"date": {"start": activity_date}},
         "Activity Type": {"select": {"name": activity_type}},
         "Subactivity Type": {"select": {"name": activity_subtype}},
-        "Activity Name": {"title": [{"text": {"content": activity_name}}]},
+        "Activity Name": {"title": _rt(activity_name)},
         "Distance (km)": {"number": round(activity.get('distance', 0) / 1000, 2)},
         "Duration (min)": {"number": round(activity.get('duration', 0) / 60, 2)},
         "Calories": {"number": round(activity.get('calories', 0))},
@@ -476,7 +511,6 @@ def create_activity(notion_client: NotionClient, database_id: str, activity: dic
         "parent": {"database_id": database_id},
         "properties": properties,
     }
-
     if icon_url:
         page["icon"] = {"type": "external", "external": {"url": icon_url}}
 
@@ -527,7 +561,6 @@ def update_activity(notion_client: NotionClient, existing_activity: dict, new_ac
         "page_id": existing_activity['id'],
         "properties": properties,
     }
-
     if icon_url:
         update["icon"] = {"type": "external", "external": {"url": icon_url}}
 
@@ -535,16 +568,26 @@ def update_activity(notion_client: NotionClient, existing_activity: dict, new_ac
 
 
 def main():
+    # Stream log output line by line so GitHub timestamps are meaningful and a hang is visible.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     load_dotenv()
 
     # Initialize Garmin and Notion clients using environment variables
     garmin_client, garmin_configuration = get_garmin_client()
     notion_client, notion_dbs = get_notion_client()
-
     database_id = notion_dbs.activities
 
     # Get all activities
     activities = get_all_activities(garmin_client, 1000)
+
+    created_count = 0
+    updated_count = 0
+    unchanged_count = 0
+    failed_count = 0
 
     # Process all activities
     for activity in activities:
@@ -558,7 +601,6 @@ def main():
                 .strptime(activity_date_raw, '%Y-%m-%d %H:%M:%S')  # Parse as format received from Garmin
                 .replace(tzinfo=UTC)  # Set timezone to UTC, as Garmin times are in GMT/UTC. Close enough.
             )
-
             activity_name = format_entertainment(activity.get('activityName', 'Unnamed Activity'))
             activity_type, activity_subtype = format_activity_type(
                 activity.get('activityType', {}).get('typeKey', 'Unknown'),
@@ -571,13 +613,18 @@ def main():
             if existing_activity:
                 if activity_needs_update(existing_activity, activity):
                     update_activity(notion_client, existing_activity, activity)
-                    # print(f"Updated: {activity_type} - {activity_name}")
+                    updated_count += 1
+                    print(f"  Updated: {activity_type} - {activity_name}")
+                else:
+                    unchanged_count += 1
                 page_id = existing_activity['id']
                 has_laps = (existing_activity['properties'].get('Has Lap Data') or {}).get('checkbox') or False
             else:
                 created_page = create_activity(notion_client, database_id, activity)
                 page_id = created_page.get('id') if created_page else None
                 has_laps = False
+                created_count += 1
+                print(f"  Created: {activity_type} - {activity_name}")
 
             # Phase 2: write the per-lap interval breakdown onto the page (once per activity)
             activity_id = activity.get('activityId')
@@ -590,12 +637,13 @@ def main():
                     )
                 time.sleep(0.3)  # be gentle on the Garmin API
 
-            # Phase 2: downsampled series + decoupling metric + HR/pace chart image (once per activity)
+            # Phase 2: downsampled series + decoupling metric + HR/pace chart image
             has_charts = False
             has_chart_image = False
             if existing_activity:
                 has_charts = (existing_activity['properties'].get('Has Charts') or {}).get('checkbox') or False
                 has_chart_image = (existing_activity['properties'].get('Has Chart Image') or {}).get('checkbox') or False
+
             if page_id and activity_id and (not has_charts or not has_chart_image):
                 duration_min = round(activity.get('duration', 0) / 60, 2)
                 chart_res = add_charts(
@@ -605,16 +653,39 @@ def main():
                 chart_props = {}
                 if not has_charts and chart_res["series"] in ("added", "skip"):
                     chart_props["Has Charts"] = {"checkbox": True}
-                    if chart_res["decoupling"] is not None:
-                        chart_props["Aerobic Decoupling (%)"] = {"number": chart_res["decoupling"]}
+                if chart_res["decoupling"] is not None:
+                    chart_props["Aerobic Decoupling (%)"] = {"number": chart_res["decoupling"]}
                 if not has_chart_image and chart_res["image"] in ("added", "skip"):
                     chart_props["Has Chart Image"] = {"checkbox": True}
                 if chart_props:
                     notion_client.pages.update(page_id=page_id, properties=chart_props)
                 time.sleep(0.4)  # be gentle on the Garmin API
+
         except Exception as e:
+            failed_count += 1
             print(f"  Skipping '{activity.get('activityName', '?')}' after error: {e}")
             continue
+
+    # Plain-language summary so a glance at the log tells you whether anything actually synced.
+    print("")
+    print("===== SYNC SUMMARY =====")
+    print(f"Activities fetched from Garmin : {len(activities)}")
+    print(f"Created in Notion              : {created_count}")
+    print(f"Updated in Notion              : {updated_count}")
+    print(f"Already up to date             : {unchanged_count}")
+    print(f"Failed                         : {failed_count}")
+    print("========================")
+
+    # Fail the run loudly rather than exiting 0 on a silent no-op.
+    if not activities:
+        print("FAILING THE RUN: Garmin returned no activities at all, so nothing could be synced.")
+        sys.exit(1)
+
+    if failed_count:
+        print(f"FAILING THE RUN: {failed_count} activity/activities could not be synced.")
+        sys.exit(1)
+
+    print("Sync completed successfully.")
 
 
 if __name__ == '__main__':
